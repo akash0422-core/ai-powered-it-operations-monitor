@@ -1,0 +1,13 @@
+{
+  "title": "IT Operations Monitor",
+  "uid": "it-ops-monitor",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "panels": [
+    {"id":1,"type":"timeseries","title":"CPU utilization (%)","gridPos":{"h":8,"w":12,"x":0,"y":0},"datasource":{"type":"postgres","uid":"operations-pg"},"targets":[{"format":"time_series","rawQuery":true,"rawSql":"SELECT collected_at AS time, cpu_percent AS \"CPU\" FROM metrics WHERE $__timeFilter(collected_at) ORDER BY collected_at","refId":"A"}],"fieldConfig":{"defaults":{"unit":"percent"},"overrides":[]},"options":{"legend":{"displayMode":"list","placement":"bottom"}}},
+    {"id":2,"type":"timeseries","title":"Memory and disk utilization (%)","gridPos":{"h":8,"w":12,"x":12,"y":0},"datasource":{"type":"postgres","uid":"operations-pg"},"targets":[{"format":"time_series","rawQuery":true,"rawSql":"SELECT collected_at AS time, memory_percent AS \"Memory\", disk_percent AS \"Disk\" FROM metrics WHERE $__timeFilter(collected_at) ORDER BY collected_at","refId":"A"}],"fieldConfig":{"defaults":{"unit":"percent"},"overrides":[]},"options":{"legend":{"displayMode":"list","placement":"bottom"}}},
+    {"id":3,"type":"table","title":"Recent alerts","gridPos":{"h":8,"w":24,"x":0,"y":8},"datasource":{"type":"postgres","uid":"operations-pg"},"targets":[{"format":"table","rawQuery":true,"rawSql":"SELECT created_at, severity, host, title, details, status FROM alerts WHERE $__timeFilter(created_at) ORDER BY created_at DESC LIMIT 100","refId":"A"}],"options":{"showHeader":true}}
+  ]
+}
+
