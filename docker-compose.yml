@@ -1,0 +1,52 @@
+services:
+  monitor:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://monitor:monitor@db:5432/monitor
+      COLLECTION_INTERVAL_SECONDS: "15"
+      CPU_THRESHOLD: "85"
+      MEMORY_THRESHOLD: "90"
+      DISK_THRESHOLD: "90"
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: monitor
+      POSTGRES_PASSWORD: monitor
+      POSTGRES_DB: monitor
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U monitor -d monitor"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+  grafana:
+    image: grafana/grafana:11.5.2
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - db
+    restart: unless-stopped
+volumes:
+  postgres_data:
+  grafana_data:
+
+
