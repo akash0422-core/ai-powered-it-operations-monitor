@@ -1,6 +1,7 @@
 import os
 import time
 from datetime import datetime, timezone
+from threading import RLock
 from typing import Any
 
 import httpx
@@ -22,6 +23,10 @@ LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/"
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 
 app = FastAPI(title="AI-powered IT Operations Monitor", version="1.0.0", description="System metrics, anomaly alerts, log summaries, and operational reports.")
+memory_lock = RLock()
+memory_metrics: list[dict[str, Any]] = []
+memory_alerts: list[dict[str, Any]] = []
+memory_logs: list[dict[str, Any]] = []
 
 
 def connect():
@@ -64,6 +69,10 @@ def save_metric(row: dict[str, Any]):
                 memory_used_bytes,disk_used_bytes,disk_total_bytes,load_1m) VALUES (%(host)s,%(collected_at)s,
                 %(cpu_percent)s,%(memory_percent)s,%(disk_percent)s,%(memory_used_bytes)s,
                 %(disk_used_bytes)s,%(disk_total_bytes)s,%(load_1m)s)""", row)
+    else:
+        with memory_lock:
+            memory_metrics.append(row)
+            del memory_metrics[:-1000]
 
 
 def save_alert(alert: dict[str, Any]):
@@ -77,6 +86,14 @@ def save_alert(alert: dict[str, Any]):
                 return
             conn.execute("INSERT INTO alerts (created_at,severity,host,title,details) VALUES (%s,%s,%s,%s,%s)",
                          (alert["created_at"], alert["severity"], alert["host"], alert["title"], alert["details"]))
+    else:
+        with memory_lock:
+            if any(a["host"] == alert["host"] and a["title"] == alert["title"] and a["status"] == "open"
+                   and (alert["created_at"] - a["created_at"]).total_seconds() < 900 for a in memory_alerts):
+                return
+            alert = {**alert, "id": len(memory_alerts) + 1, "status": "open"}
+            memory_alerts.append(alert)
+            del memory_alerts[:-500]
     if WEBHOOK_URL:
         try:
             httpx.post(WEBHOOK_URL, json=alert, timeout=4).raise_for_status()
@@ -123,7 +140,12 @@ def detect_alerts(metric: dict[str, Any]):
                         "host": metric["host"], "title": f"High {key.replace('_percent', '').upper()} utilization",
                         "details": f"{key.replace('_percent', '')} is {value:.1f}%, above the configured threshold of {threshold:.1f}%."})
     # A robust median/MAD detector avoids flagging normal gradual changes. Requires a baseline.
-    prior = fetch("SELECT cpu_percent,memory_percent,disk_percent FROM metrics ORDER BY collected_at DESC LIMIT 30")
+    if DATABASE_URL:
+        prior = fetch("SELECT cpu_percent,memory_percent,disk_percent FROM metrics ORDER BY collected_at DESC LIMIT 30")
+    else:
+        with memory_lock:
+            recent = memory_metrics[-31:-1]
+            prior = [(r["cpu_percent"], r["memory_percent"], r["disk_percent"]) for r in reversed(recent)]
     if len(prior) >= 10:
         import statistics
         for key in THRESHOLDS:
@@ -161,12 +183,18 @@ def dashboard():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "database": bool(DATABASE_URL), "collection_interval_seconds": INTERVAL, "thresholds": THRESHOLDS}
+    return {"status": "ok", "database": bool(DATABASE_URL), "storage": "postgresql" if DATABASE_URL else "in-memory",
+            "collection_interval_seconds": INTERVAL, "thresholds": THRESHOLDS}
 
 
 @app.get("/api/metrics/latest")
 def latest_metrics():
     rows = fetch("SELECT host,collected_at,cpu_percent,memory_percent,disk_percent,memory_used_bytes,disk_used_bytes,disk_total_bytes,load_1m FROM metrics ORDER BY collected_at DESC LIMIT 1")
+    if not DATABASE_URL:
+        with memory_lock:
+            latest = memory_metrics[-1].copy() if memory_metrics else None
+        if latest:
+            return latest
     if not rows:
         return {"host": os.getenv("HOSTNAME", "localhost"), "collected_at": datetime.now(timezone.utc).isoformat(), "cpu_percent": psutil.cpu_percent(), "memory_percent": psutil.virtual_memory().percent, "disk_percent": psutil.disk_usage(os.getenv("MONITOR_DISK_PATH", "/")).percent, "memory_used_bytes": psutil.virtual_memory().used, "disk_used_bytes": 0, "disk_total_bytes": 0, "load_1m": None}
     return rows_as_dicts(rows, ["host", "collected_at", "cpu_percent", "memory_percent", "disk_percent", "memory_used_bytes", "disk_used_bytes", "disk_total_bytes", "load_1m"])[0]
@@ -176,6 +204,10 @@ def latest_metrics():
 def metrics_history(limit: int = 100):
     limit = max(1, min(limit, 1000))
     rows = fetch("SELECT collected_at,cpu_percent,memory_percent,disk_percent FROM metrics ORDER BY collected_at DESC LIMIT %s", (limit,))
+    if not DATABASE_URL:
+        with memory_lock:
+            return [{k: r[k] for k in ("collected_at", "cpu_percent", "memory_percent", "disk_percent")}
+                    for r in memory_metrics[-limit:]]
     return rows_as_dicts(rows, ["collected_at", "cpu_percent", "memory_percent", "disk_percent"])[::-1]
 
 
@@ -184,6 +216,10 @@ def alerts(limit: int = 50, status: str = ""):
     limit = max(1, min(limit, 200))
     if status not in ("", "open", "resolved"):
         raise HTTPException(400, "status must be open or resolved")
+    if not DATABASE_URL:
+        with memory_lock:
+            items = [a.copy() for a in memory_alerts if not status or a["status"] == status]
+        return sorted(items, key=lambda a: a["created_at"], reverse=True)[:limit]
     query = "SELECT id,created_at,severity,host,title,details,status FROM alerts"
     params: list[Any] = []
     if status:
@@ -195,7 +231,12 @@ def alerts(limit: int = 50, status: str = ""):
 @app.post("/api/alerts/{alert_id}/resolve")
 def resolve_alert(alert_id: int):
     if not DATABASE_URL:
-        raise HTTPException(503, "Database is not configured")
+        with memory_lock:
+            for item in memory_alerts:
+                if item["id"] == alert_id:
+                    item["status"] = "resolved"
+                    return {"id": alert_id, "status": "resolved"}
+        raise HTTPException(404, "Alert not found")
     with connect() as conn:
         cur = conn.execute("UPDATE alerts SET status='resolved' WHERE id=%s", (alert_id,))
         if cur.rowcount == 0:
@@ -243,6 +284,25 @@ async def analyze_logs(batch: LogBatch):
 
 @app.get("/api/reports/daily")
 def daily_report():
+    if not DATABASE_URL:
+        cutoff = datetime.now(timezone.utc).timestamp() - 86400
+        with memory_lock:
+            samples = [m for m in memory_metrics if m["collected_at"].timestamp() >= cutoff]
+            recent_alerts = [a for a in memory_alerts if a["created_at"].timestamp() >= cutoff]
+        def avg_peak(key):
+            values = [m[key] for m in samples]
+            return (sum(values) / len(values), max(values)) if values else (None, None)
+        cpu_avg, cpu_peak = avg_peak("cpu_percent")
+        mem_avg, mem_peak = avg_peak("memory_percent")
+        disk_avg, disk_peak = avg_peak("disk_percent")
+        counts: dict[str, int] = {}
+        for alert in recent_alerts:
+            counts[alert["severity"]] = counts.get(alert["severity"], 0) + 1
+        return {"period": "last 24 hours", "generated_at": datetime.now(timezone.utc), "samples": len(samples),
+                "cpu": {"average_percent": cpu_avg, "peak_percent": cpu_peak},
+                "memory": {"average_percent": mem_avg, "peak_percent": mem_peak},
+                "disk": {"average_percent": disk_avg, "peak_percent": disk_peak},
+                "alerts_by_severity": counts}
     metrics = fetch("SELECT COUNT(*),AVG(cpu_percent),MAX(cpu_percent),AVG(memory_percent),MAX(memory_percent),AVG(disk_percent),MAX(disk_percent) FROM metrics WHERE collected_at >= NOW() - INTERVAL '24 hours'")
     alert_rows = fetch("SELECT severity,COUNT(*) FROM alerts WHERE created_at >= NOW() - INTERVAL '24 hours' GROUP BY severity")
     values = metrics[0] if metrics else (0, None, None, None, None, None, None)
