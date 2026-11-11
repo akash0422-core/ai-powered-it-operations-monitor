@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: ai-powered-it-operations-monitor
+    runtime: docker
+    plan: free
+    region: singapore
+    branch: main
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: COLLECTION_INTERVAL_SECONDS
+        value: "15"
+      - key: CPU_THRESHOLD
+        value: "85"
+      - key: MEMORY_THRESHOLD
+        value: "90"
+      - key: DISK_THRESHOLD
+        value: "90"
